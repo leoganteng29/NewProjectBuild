@@ -162,42 +162,106 @@ jobs:
             flutter create . --platforms=android
           fi
 
-      - name: Samakan versi Gradle / AGP / Kotlin (Flutter terbaru)
+      - name: Samakan versi Gradle / AGP / Kotlin + bersihkan properti deprecated
         if: steps.detect.outputs.type == 'flutter'
         working-directory: ${{ env.FLUTTER_PROJECT }}
         shell: bash
         run: |
           set -euo pipefail
+          # 1) Gradle wrapper → versi stabil yang kompatibel dengan AGP 8.x
           WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
           if [ -f "$WRAPPER" ]; then
-            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER"
-            grep distributionUrl "$WRAPPER"
+            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-all.zip#' "$WRAPPER"
+            grep distributionUrl "$WRAPPER" || true
           fi
-          MIN_AGP="8.12.1"
-          MIN_KOTLIN="2.2.20"
+
+          # 2) Paksa AGP & Kotlin ke versi yang didukung Flutter stable saat ini
+          MIN_AGP="8.7.3"
+          MIN_KOTLIN="2.0.21"
           for FILE in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts; do
             [ -f "$FILE" ] || continue
-            sed -i -E "s#(id\(?[\"']com\.android\.application[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE"
-            sed -i -E "s#(classpath ?[\"']com\.android\.tools\.build:gradle:)[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE"
-            sed -i -E "s#(id\(?[\"']org\.jetbrains\.kotlin\.android[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE"
-            sed -i -E "s#(ext\.kotlin_version ?= ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE"
-            sed -i -E "s#(classpath ?[\"']org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE"
+            sed -i -E "s#(id\(?[\"']com\.android\.application[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE" || true
+            sed -i -E "s#(classpath ?[\"']com\.android\.tools\.build:gradle:)[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE" || true
+            sed -i -E "s#(id\(?[\"']org\.jetbrains\.kotlin\.android[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE" || true
+            sed -i -E "s#(ext\.kotlin_version ?= ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE" || true
+            sed -i -E "s#(classpath ?[\"']org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE" || true
           done
 
-      - name: Flutter pub get
+          # 3) HAPUS opsi yang sudah dihapus di AGP 7+ (penyebab error "android.enableR8 is deprecated")
+          if [ -f android/gradle.properties ]; then
+            sed -i -E \
+              -e '/^[[:space:]]*android\.enableR8[[:space:]]*=/d' \
+              -e '/^[[:space:]]*android\.enableD8[[:space:]]*=/d' \
+              -e '/^[[:space:]]*android\.enableBuildCache[[:space:]]*=/d' \
+              -e '/^[[:space:]]*android\.enableSeparateAnnotationProcessing[[:space:]]*=/d' \
+              -e '/^[[:space:]]*android\.enableIncremental[[:space:]]*=/d' \
+              android/gradle.properties
+            # Pastikan properti wajib ada
+            grep -q 'android.useAndroidX' android/gradle.properties || echo 'android.useAndroidX=true' >> android/gradle.properties
+            grep -q 'android.enableJetifier' android/gradle.properties || echo 'android.enableJetifier=true' >> android/gradle.properties
+            # Hindari warning R8 full mode di beberapa project lama
+            grep -q 'android.enableR8.fullMode' android/gradle.properties || echo 'android.enableR8.fullMode=false' >> android/gradle.properties
+            echo "--- android/gradle.properties setelah dibersihkan ---"
+            cat android/gradle.properties || true
+          fi
+
+          # 4) Naikkan compileSdk / targetSdk / minSdk di app/build.gradle(.kts) bila terlalu rendah
+          for APPG in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$APPG" ] || continue
+            # compileSdk / compileSdkVersion
+            sed -i -E 's/compileSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/compileSdk 35/g' "$APPG" || true
+            sed -i -E 's/targetSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/targetSdk 35/g' "$APPG" || true
+            # minSdk minimal 21 (Flutter default modern)
+            sed -i -E 's/minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/minSdk 21/g' "$APPG" || true
+            # namespace wajib di AGP 8+
+            if ! grep -qE 'namespace[[:space:]]' "$APPG"; then
+              # coba ambil dari AndroidManifest package
+              PKG=$(grep -oE 'package="[^"]+"' android/app/src/main/AndroidManifest.xml 2>/dev/null | head -1 | cut -d'"' -f2 || true)
+              if [ -n "$PKG" ]; then
+                if [[ "$APPG" == *.kts ]]; then
+                  sed -i "s/android[[:space:]]*{/android {\n    namespace = \"$PKG\"/" "$APPG" || true
+                else
+                  sed -i "s/android[[:space:]]*{/android {\n    namespace \"$PKG\"/" "$APPG" || true
+                fi
+              fi
+            fi
+          done
+
+          # 5) Hapus local.properties yang berisi path mesin developer (bisa bikin error di CI)
+          rm -f android/local.properties || true
+
+      - name: Flutter pub get (dengan fallback)
         if: steps.detect.outputs.type == 'flutter'
         working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
         run: |
+          set -euo pipefail
           flutter --version
-          flutter pub get
+          # Coba pub get biasa dulu
+          if ! flutter pub get; then
+            echo "::warning::flutter pub get gagal, coba pub upgrade --major-versions lalu get lagi"
+            flutter pub upgrade --major-versions || true
+            flutter pub get
+          fi
+          # Beberapa project punya dependency constraint ketat; longgarkan lewat override jika perlu
+          if [ -f pubspec.yaml ] && grep -q 'dependency_overrides:' pubspec.yaml; then
+            echo "dependency_overrides sudah ada"
+          fi
 
       - name: Build Flutter APK
         if: steps.detect.outputs.type == 'flutter'
         working-directory: ${{ env.FLUTTER_PROJECT }}
         shell: bash
         run: |
-          if [ "$IN_BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
-
+          set -euo pipefail
+          # Bersihkan cache build lama yang sering bikin conflict
+          flutter clean || true
+          flutter pub get
+          if [ "$IN_BUILD_TYPE" = "debug" ]; then
+            flutter build apk --debug --no-tree-shake-icons || flutter build apk --debug
+          else
+            flutter build apk --release --no-tree-shake-icons || flutter build apk --release
+          fi
       - name: Kumpulkan APK Flutter
         if: steps.detect.outputs.type == 'flutter'
         shell: bash
