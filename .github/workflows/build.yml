@@ -1,368 +1,471 @@
-name: Build APK
-run-name: "Build #${{ inputs.job_id }} (${{ inputs.kind }})"
+name: APK Builder (Flutter / Android / Web)
+
+# File ini DI-SYNC OTOMATIS oleh bot ke repo GitHub (.github/workflows/build.yml).
+# Tidak perlu secret apa pun: bot sendiri yang mengunduh APK dari artifact lalu mengirimnya ke Telegram.
+run-name: "build ${{ inputs.job_id }}"
 
 on:
   workflow_dispatch:
     inputs:
-      kind:
-        description: "flutter | web"
-        required: true
-        type: string
-      source:
-        description: "file_id ZIP (flutter) atau URL website (web)"
-        required: true
-        type: string
-      build_type:
-        description: "debug | release"
-        required: true
-        default: "release"
-        type: string
-      chat_id:
-        required: true
-        type: string
-      message_id:
-        required: true
-        type: string
       job_id:
+        description: "ID job dari bot (dipakai bot untuk mengenali run ini)"
         required: true
         type: string
+      kind:
+        description: "auto = deteksi dari isi ZIP, web = bungkus URL jadi APK"
+        required: true
+        type: choice
+        default: auto
+        options:
+          - auto
+          - flutter
+          - android
+          - web
+      build_type:
+        description: "release atau debug"
+        required: true
+        type: choice
+        default: release
+        options:
+          - release
+          - debug
+      release_tag:
+        description: "Tag release GitHub tempat ZIP / ikon diupload"
+        required: true
+        type: string
+      asset_name:
+        description: "Nama file ZIP di release (kosong untuk mode web)"
+        required: false
+        type: string
+        default: ""
+      icon_name:
+        description: "Nama file ikon di release (opsional)"
+        required: false
+        type: string
+        default: ""
+      web_url:
+        description: "URL website (mode web)"
+        required: false
+        type: string
+        default: ""
       app_name:
+        description: "Nama aplikasi (mode web)"
         required: false
-        default: ""
         type: string
-      icon_id:
-        required: false
         default: ""
-        type: string
-      user_label:
-        required: false
-        default: ""
-        type: string
-      log_chat:
-        required: false
-        default: ""
-        type: string
 
 permissions:
   contents: read
 
-# KEAMANAN: kode project user hanya berjalan di job "build" yang TANPA secret.
-#   prepare -> punya secret, hanya mengunduh file
-#   build   -> TANPA secret, menjalankan flutter/gradle milik user
-#   deliver -> punya secret, hanya mengirim hasil
-
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      CHAT_ID: ${{ inputs.chat_id }}
-      MESSAGE_ID: ${{ inputs.message_id }}
-      JOB_ID: ${{ inputs.job_id }}
-      KIND: ${{ inputs.kind }}
-      SOURCE: ${{ inputs.source }}
-      BUILD_TYPE: ${{ inputs.build_type }}
-      APP_NAME: ${{ inputs.app_name }}
-      ICON_ID: ${{ inputs.icon_id }}
-      USER_LABEL: ${{ inputs.user_label }}
-      LOG_CHAT: ${{ inputs.log_chat }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Validasi input
-        run: |
-          [[ "$KIND" =~ ^(flutter|web)$ ]] || { echo "kind salah"; exit 1; }
-          [[ "$BUILD_TYPE" =~ ^(debug|release)$ ]] || { echo "build_type salah"; exit 1; }
-          [[ "$CHAT_ID" =~ ^-?[0-9]+$ && "$MESSAGE_ID" =~ ^[0-9]+$ ]] || { echo "chat/message id salah"; exit 1; }
-          [[ "$JOB_ID" =~ ^[A-Za-z0-9]+$ ]] || { echo "job_id salah"; exit 1; }
-          [[ "$ICON_ID" =~ ^[A-Za-z0-9_-]*$ ]] || { echo "icon_id salah"; exit 1; }
-          if [ "$KIND" = "web" ]; then
-            [[ "$SOURCE" =~ ^https?://[^[:space:]]+$ ]] || { echo "URL tidak valid"; exit 1; }
-            [ -n "$APP_NAME" ] || { echo "nama app kosong"; exit 1; }
-          else
-            [[ "$SOURCE" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "file_id salah"; exit 1; }
-          fi
-
-      - name: Notif mulai
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        run: |
-          source scripts/tg.sh
-          progress 10 "Runner siap, menyiapkan file…"
-          notify_admin "$(em build 🛠) <b>Build Dimulai</b> <code>#${JOB_ID}</code>
-          <blockquote>$(em user 👤) $(user_label)
-          $(em package 📦) $(kind_label)</blockquote>"
-
-      - name: Ambil file dari Telegram
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
-        run: |
-          source scripts/tg.sh
-          mkdir -p work
-          echo "$JOB_ID" > work/info.txt
-          if [ "$KIND" = "flutter" ]; then
-            progress 20 "Mengunduh ZIP project (maks 100 MB)…"
-            if start_local_api; then
-              local_download "$SOURCE" work/source.zip || { echo "Unduh via Local Bot API gagal"; exit 1; }
-            else
-              echo "TG_API_ID/TG_API_HASH tidak ada -> pakai Bot API biasa (maks 20 MB)"
-              cloud_download "$SOURCE" work/source.zip || { echo "Unduh gagal (ZIP > 20 MB butuh TG_API_ID & TG_API_HASH)"; exit 1; }
-            fi
-            SZ=$(stat -c%s work/source.zip)
-            echo "Ukuran ZIP: $SZ byte"
-            [ "$SZ" -le 104857600 ] || { echo "ZIP > 100 MB"; exit 1; }
-          elif [ -n "$ICON_ID" ]; then
-            progress 20 "Mengunduh ikon…"
-            cloud_download "$ICON_ID" work/icon.bin || echo "Ikon gagal diunduh, pakai ikon default"
-          fi
-          ls -la work
-
-      - name: Notif build
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        run: |
-          source scripts/tg.sh
-          progress 40 "File siap. Proses build berjalan (bisa beberapa menit)…"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: source
-          path: work/
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: ignore
-
-      - name: Notif gagal (prepare)
-        if: failure()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-        run: |
-          source scripts/tg.sh
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          KB=$(jq -cn --argjson a "$(kbtn "Lihat Log" "📋" link "$RUN_URL" primary)" '{inline_keyboard:[[$a]]}')
-          tg_edit "$(em fail ❌) <b>Gagal menyiapkan file</b> <code>#${JOB_ID}</code>
-          <blockquote>ZIP &gt; 20 MB butuh secret <code>TG_API_ID</code> &amp; <code>TG_API_HASH</code>. Cek juga link/file yang dikirim.</blockquote>" "$KB"
-          notify_admin "$(em fail ❌) <b>Build Gagal (persiapan)</b> <code>#${JOB_ID}</code>
-          <blockquote>$(em user 👤) $(user_label)</blockquote>"
-
   build:
-    needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      KIND: ${{ inputs.kind }}
-      BUILD_TYPE: ${{ inputs.build_type }}
-      APP_NAME: ${{ inputs.app_name }}
-      WEB_URL: ${{ inputs.source }}
-      JOB_ID: ${{ inputs.job_id }}
+      IN_KIND: ${{ inputs.kind }}
+      IN_BUILD_TYPE: ${{ inputs.build_type }}
+      IN_TAG: ${{ inputs.release_tag }}
+      IN_ASSET: ${{ inputs.asset_name }}
+      IN_ICON: ${{ inputs.icon_name }}
+      IN_URL: ${{ inputs.web_url }}
+      IN_APP_NAME: ${{ inputs.app_name }}
+      IN_JOB: ${{ inputs.job_id }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: .
-
-      - name: Validasi project Flutter
-        if: inputs.kind == 'flutter'
+      - name: Bersihkan ruang disk runner
+        shell: bash
         run: |
-          fail() { echo "$1" | tee reason.txt; cp reason.txt build.log; exit 1; }
-          mkdir src
-          unzip -q source.zip -d src || fail "File ZIP rusak / tidak bisa diekstrak."
-          P=$(find src -maxdepth 3 -name pubspec.yaml -not -path '*/__MACOSX/*' | awk '{print length($0), $0}' | sort -n | head -1 | cut -d' ' -f2-)
-          [ -n "$P" ] || fail "pubspec.yaml tidak ditemukan. ZIP wajib berisi project Flutter."
-          grep -Eq '^[[:space:]]+sdk:[[:space:]]*flutter' "$P" || fail "pubspec.yaml bukan project Flutter (tidak ada 'sdk: flutter')."
-          D=$(dirname "$P")
-          [ -d "$D/lib" ] || fail "Folder lib/ tidak ditemukan."
-          [ -d "$D/android" ] || fail "Folder android/ tidak ditemukan (jalankan 'flutter create --platforms=android .' lalu zip ulang)."
-          PUB=$(grep -m1 -E '^name:' "$P" | awk '{print $2}' | tr -cd 'A-Za-z0-9_-')
-          echo "PROJ_DIR=$GITHUB_WORKSPACE/$D" >> "$GITHUB_ENV"
-          echo "PUB_NAME=${PUB:-flutter_app}" >> "$GITHUB_ENV"
-          echo "Project Flutter valid: $D"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          df -h /
 
-      - uses: actions/setup-java@v4
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
         with:
-          packages: "platform-tools platforms;android-34 build-tools;34.0.0"
+          # jangan install package "tools" (sudah dihapus Google, bikin sdkmanager exit 1)
+          packages: platform-tools platforms;android-35 platforms;android-34 build-tools;35.0.0 build-tools;34.0.0
 
-      - uses: subosito/flutter-action@v2
-        if: inputs.kind == 'flutter'
+      - name: Download ZIP / ikon dari Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dl workspace output
+          if [ -n "$IN_ASSET" ]; then
+            gh release download "$IN_TAG" --repo "${{ github.repository }}" --pattern "$IN_ASSET" --dir dl --clobber
+            test -s "dl/$IN_ASSET" || { echo "::error::Gagal download asset '$IN_ASSET' dari release '$IN_TAG'"; exit 1; }
+            unzip -q -o "dl/$IN_ASSET" -d workspace
+            echo "Isi ZIP (maks 4 level):"
+            find workspace -maxdepth 4 -type f | sort | head -200
+          fi
+          if [ -n "$IN_ICON" ]; then
+            gh release download "$IN_TAG" --repo "${{ github.repository }}" --pattern "$IN_ICON" --dir dl --clobber || echo "::warning::Ikon tidak bisa diunduh, pakai ikon default"
+          fi
+
+      - name: Detect project
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          shallowest() { # $1 = nama file; ambil yang paling dekat ke root, abaikan folder tersembunyi/build
+            find workspace -type f -name "$1" -not -path '*/.*' -not -path '*/build/*' -not -path '*/node_modules/*' \
+              | awk '{ n=gsub("/","/"); print n, $0 }' | sort -n | head -1 | cut -d' ' -f2-
+          }
+          TYPE="$IN_KIND"
+          if [ "$TYPE" = "auto" ]; then
+            if [ -n "$(shallowest pubspec.yaml)" ]; then TYPE=flutter
+            elif [ -n "$(shallowest gradlew)" ] || [ -n "$(shallowest settings.gradle)" ] || [ -n "$(shallowest settings.gradle.kts)" ]; then TYPE=android
+            elif [ -n "$(find workspace -type f -iname '*.html' -print -quit)" ]; then TYPE=webzip
+            else TYPE=unknown; fi
+          fi
+          echo "Tipe project: $TYPE"
+          echo "type=$TYPE" >> "$GITHUB_OUTPUT"
+          if [ "$TYPE" = "flutter" ]; then
+            P="$(shallowest pubspec.yaml)"; [ -n "$P" ] || { echo "::error::pubspec.yaml tidak ditemukan di ZIP."; exit 1; }
+            echo "FLUTTER_PROJECT=$(dirname "$P")" >> "$GITHUB_ENV"
+          elif [ "$TYPE" = "android" ]; then
+            G="$(shallowest gradlew)"
+            if [ -z "$G" ]; then G="$(shallowest settings.gradle)"; fi
+            if [ -z "$G" ]; then G="$(shallowest settings.gradle.kts)"; fi
+            [ -n "$G" ] || { echo "::error::Project Android tidak ditemukan di ZIP."; exit 1; }
+            echo "ANDROID_PROJECT=$(dirname "$G")" >> "$GITHUB_ENV"
+          elif [ "$TYPE" = "unknown" ]; then
+            echo "::error::ZIP tidak berisi project Flutter, Android, atau Web (HTML)."
+            exit 1
+          fi
+
+      # ───────────────────────── FLUTTER ─────────────────────────
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
         with:
           channel: stable
-          cache: false
+          cache: true
 
-      - uses: gradle/actions/setup-gradle@v4
-        if: inputs.kind == 'web'
-        with:
-          gradle-version: "8.10.2"
-          cache-disabled: true
-
-      - name: Build Flutter
-        if: inputs.kind == 'flutter'
+      - name: Siapkan folder android (jika belum ada)
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
         run: |
-          cd "$PROJ_DIR"
-          flutter config --no-analytics >/dev/null 2>&1 || true
-          flutter --version 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-          flutter pub get 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
-          flutter build apk "--$BUILD_TYPE" 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          set -euo pipefail
+          if [ ! -d android ]; then
+            echo "Folder android/ tidak ada, membuat dengan flutter create..."
+            flutter create . --platforms=android
+          fi
 
-      - name: Build Web to APK
-        if: inputs.kind == 'web'
+      - name: Samakan versi Gradle / AGP / Kotlin (Flutter terbaru)
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
         run: |
-          command -v convert >/dev/null 2>&1 || command -v magick >/dev/null 2>&1 || sudo apt-get install -y -qq imagemagick >/dev/null 2>&1 || true
-          python3 scripts/gen_webapp.py 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
-          cd webproj
-          gradle assembleRelease --no-daemon --console=plain 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          set -euo pipefail
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          if [ -f "$WRAPPER" ]; then
+            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER"
+            grep distributionUrl "$WRAPPER"
+          fi
+          MIN_AGP="8.12.1"
+          MIN_KOTLIN="2.2.20"
+          for FILE in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts; do
+            [ -f "$FILE" ] || continue
+            sed -i -E "s#(id\(?[\"']com\.android\.application[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE"
+            sed -i -E "s#(classpath ?[\"']com\.android\.tools\.build:gradle:)[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE"
+            sed -i -E "s#(id\(?[\"']org\.jetbrains\.kotlin\.android[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE"
+            sed -i -E "s#(ext\.kotlin_version ?= ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE"
+            sed -i -E "s#(classpath ?[\"']org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE"
+          done
 
-      - name: Kumpulkan APK
+      - name: Flutter pub get
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
         run: |
-          if [ "$KIND" = "flutter" ]; then SEARCH="$PROJ_DIR"; NAME="$PUB_NAME"
-          else SEARCH="$GITHUB_WORKSPACE/webproj"; NAME=$(printf '%s' "$APP_NAME" | tr -cd 'A-Za-z0-9_-' | head -c 30); NAME="${NAME:-webapp}"; fi
-          APK=$(find "$SEARCH" -path '*build/*outputs*' -name '*.apk' -not -path '*androidTest*' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
-          [ -n "$APK" ] || { echo "APK tidak ditemukan setelah build"; exit 1; }
-          mkdir -p out
-          cp "$APK" out/raw.apk
-          printf '%s' "$NAME" > out/name.txt
-          ls -lh out
+          flutter --version
+          flutter pub get
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: apk
-          path: out/
-          retention-days: 1
-          compression-level: 0
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: buildlog
-          path: |
-            build.log
-            reason.txt
-          retention-days: 1
-          if-no-files-found: ignore
-
-  deliver:
-    needs: [prepare, build]
-    if: always() && needs.prepare.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CHAT_ID: ${{ inputs.chat_id }}
-      MESSAGE_ID: ${{ inputs.message_id }}
-      JOB_ID: ${{ inputs.job_id }}
-      KIND: ${{ inputs.kind }}
-      SOURCE: ${{ inputs.source }}
-      BUILD_TYPE: ${{ inputs.build_type }}
-      USER_LABEL: ${{ inputs.user_label }}
-      LOG_CHAT: ${{ inputs.log_chat }}
-      BUILD_RESULT: ${{ needs.build.result }}
-      RUN_STARTED: ${{ github.run_started_at }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@v4
-        if: needs.build.result == 'success'
-        with:
-          name: apk
-          path: dl
-
-      - uses: actions/download-artifact@v4
-        if: needs.build.result != 'success'
-        continue-on-error: true
-        with:
-          name: buildlog
-          path: logdl
-
-      - name: Siapkan file final
-        if: needs.build.result == 'success'
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        shell: bash
         run: |
-          mkdir -p final
-          NAME=$(cat dl/name.txt)
-          if [ "$KIND" = "web" ]; then OUT="final/${NAME}.apk"; else OUT="final/${NAME}-${BUILD_TYPE}.apk"; fi
-          cp dl/raw.apk "$OUT"
-          ls -lh final
+          if [ "$IN_BUILD_TYPE" = "debug" ]; then flutter build apk --debug; else flutter build apk --release; fi
 
-      - uses: actions/upload-artifact@v4
-        if: needs.build.result == 'success'
-        with:
-          name: apk-${{ inputs.job_id }}
-          path: final/*.apk
-          retention-days: 7
-          compression-level: 0
+      - name: Kumpulkan APK Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find "$FLUTTER_PROJECT/build/app/outputs/flutter-apk" -type f -name '*.apk' -print -quit)"
+          [ -n "$APK" ] || { echo "::error::APK Flutter tidak ditemukan."; exit 1; }
+          cp "$APK" output/app-release.apk
 
-      - name: Kirim hasil ke Telegram
+      # ───────────────────────── ANDROID NATIVE ─────────────────────────
+      - name: Build Android native
+        if: steps.detect.outputs.type == 'android'
+        working-directory: ${{ env.ANDROID_PROJECT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f gradlew ] || [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+            echo "gradlew / wrapper jar tidak lengkap, regenerasi wrapper..."
+            gradle wrapper --gradle-version 8.10.2
+          fi
+          chmod +x ./gradlew
+          if [ "$IN_BUILD_TYPE" = "debug" ]; then ./gradlew assembleDebug --no-daemon --stacktrace; else ./gradlew assembleRelease --no-daemon --stacktrace; fi
+
+      - name: Kumpulkan APK Android
+        if: steps.detect.outputs.type == 'android'
+        shell: bash
+        run: |
+          set -euo pipefail
+          V=release; [ "$IN_BUILD_TYPE" = "debug" ] && V=debug
+          APK="$(find "$ANDROID_PROJECT" -type f -path "*/build/outputs/apk/$V/*" -name '*.apk' -print -quit)"
+          [ -n "$APK" ] || APK="$(find "$ANDROID_PROJECT" -type f -path '*/build/outputs/apk/*' -name '*.apk' -print -quit)"
+          [ -n "$APK" ] || { echo "::error::APK Android tidak ditemukan."; exit 1; }
+          if [ "$V" = "debug" ]; then cp "$APK" output/app-release.apk; else cp "$APK" output/app-unsigned.apk; fi
+
+      # ───────────────────────── WEB (URL / ZIP HTML) ─────────────────────────
+      - name: Buat project WebView
+        if: steps.detect.outputs.type == 'web' || steps.detect.outputs.type == 'webzip'
+        shell: bash
         env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_API_ID: ${{ secrets.TG_API_ID }}
-          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+          WEB_TYPE: ${{ steps.detect.outputs.type }}
         run: |
-          source scripts/tg.sh
-          DUR=$(( $(date +%s) - $(date -d "$RUN_STARTED" +%s) ))
-          DURH="$((DUR/60))m $((DUR%60))s"
-          RUNBTN=$(kbtn "Lihat Run" "📋" link "$RUN_URL" primary)
+          set -euo pipefail
+          if [ "$IN_KIND" = "web" ]; then
+            [ -n "$IN_URL" ] || { echo "::error::web_url kosong."; exit 1; }
+          fi
 
-          if [ "$BUILD_RESULT" = "success" ]; then
-            F=$(ls final/*.apk | head -1)
-            BYTES=$(stat -c%s "$F"); SIZE=$(numfmt --to=iec "$BYTES")
-            SHA=$(sha256sum "$F" | cut -c1-16)
-            NAME=$(basename "$F" | esc)
-            progress 90 "Mengunggah APK ke Telegram…"
-            if start_local_api; then FILE_API="$LOCAL_API"; else FILE_API="$API_CLOUD"; fi
-            if tg_send_doc "$F"; then
-              KB=$(jq -cn --argjson a "$(cbtn "Build Lagi" "🔁" rocket h:new success)" --argjson b "$RUNBTN" '{inline_keyboard:[[$a,$b]]}')
-              tg_edit "$(em ok ✅) <b>Build Berhasil!</b> <code>#${JOB_ID}</code>
-          <blockquote>$(em package 📦) <code>${NAME}</code>
-          $(em build 🛠) Mode: <b>$(kind_label)</b>
-          💾 Ukuran: <b>${SIZE}</b>
-          🔐 SHA256: <code>${SHA}…</code>
-          $(em clock ⏱) Durasi: <b>${DURH}</b></blockquote>
-          $(em rocket 🚀) <i>File APK dikirim di bawah ⬇️</i>" "$KB"
-              notify_admin "$(em ok ✅) <b>Build Selesai</b> <code>#${JOB_ID}</code>
-          <blockquote>$(em user 👤) $(user_label)
-          $(em package 📦) $(kind_label) · ${SIZE} · ${DURH}</blockquote>"
+          mkdir -p webview/app/src/main/java/app/webview webview/app/src/main/res/values webview/app/src/main/assets
+
+          START_URL="$IN_URL"
+          LABEL="$IN_APP_NAME"
+          if [ "$WEB_TYPE" = "webzip" ]; then
+            INDEX=""
+            for NAME in index.html splash.html login.html dashboard.html; do
+              F="$(find workspace -type f -iname "$NAME" -print -quit)"
+              if [ -n "$F" ]; then INDEX="$F"; break; fi
+            done
+            [ -n "$INDEX" ] || INDEX="$(find workspace -type f -iname '*.html' -print -quit)"
+            WEB_ROOT="$(dirname "$INDEX")"
+            cp -r "$WEB_ROOT"/. webview/app/src/main/assets/
+            if [ "$(basename "$INDEX")" != "index.html" ]; then cp "$INDEX" webview/app/src/main/assets/index.html; fi
+            START_URL="file:///android_asset/index.html"
+          fi
+          [ -n "$LABEL" ] || LABEL="Web App"
+
+          cat > "$RUNNER_TEMP/icon.py" <<'PY'
+          import sys
+          from PIL import Image
+          im = Image.open(sys.argv[1]).convert("RGBA")
+          im.thumbnail((512, 512))
+          im.save(sys.argv[2], "PNG")
+          PY
+
+          # ikon opsional
+          ICON_ATTR=""
+          if [ -n "$IN_ICON" ] && [ -s "dl/$IN_ICON" ]; then
+            mkdir -p webview/app/src/main/res/mipmap-xxxhdpi
+            if command -v convert >/dev/null 2>&1 && convert "dl/$IN_ICON[0]" -resize 512x512 -background none -gravity center -extent 512x512 webview/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png 2>/dev/null; then
+              ICON_ATTR='android:icon="@mipmap/ic_launcher"'
+            elif python3 -c "import PIL" 2>/dev/null && python3 "$RUNNER_TEMP/icon.py" "dl/$IN_ICON" webview/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png; then
+              ICON_ATTR='android:icon="@mipmap/ic_launcher"'
             else
-              KB=$(jq -cn --argjson a "$RUNBTN" '{inline_keyboard:[[$a]]}')
-              tg_edit "$(em fail ⚠️) <b>Build berhasil, tapi gagal mengirim APK</b> <code>#${JOB_ID}</code>
-          <blockquote>💾 ${SIZE}. Unduh dari Artifact di halaman Run. File &gt; 50 MB butuh secret <code>TG_API_ID</code> &amp; <code>TG_API_HASH</code>.</blockquote>" "$KB"
-              notify_admin "$(em fail ⚠️) <b>Build OK, kirim gagal</b> <code>#${JOB_ID}</code>"
-            fi
-          else
-            KB=$(jq -cn --argjson a "$RUNBTN" --argjson b "$(cbtn "Coba Lagi" "🔁" rocket h:new success)" '{inline_keyboard:[[$b,$a]]}')
-            if [ "$BUILD_RESULT" = "cancelled" ]; then
-              tg_edit "$(em fail ✖️) <b>Build dibatalkan</b> <code>#${JOB_ID}</code>" "$KB"
-              notify_admin "$(em fail ✖️) <b>Build Dibatalkan</b> <code>#${JOB_ID}</code>"
-            elif [ -f logdl/reason.txt ]; then
-              REASON=$(head -c 400 logdl/reason.txt | esc)
-              tg_edit "$(em fail ❌) <b>Build Ditolak</b> <code>#${JOB_ID}</code>
-          <blockquote>${REASON}</blockquote>" "$KB"
-              notify_admin "$(em fail ❌) <b>Build Ditolak</b> <code>#${JOB_ID}</code>
-          <blockquote>$(user_label)
-          ${REASON}</blockquote>"
-            else
-              LOG=logdl/build.log; TAIL="(log tidak tersedia)"
-              if [ -f "$LOG" ]; then
-                if grep -Eq 'What went wrong|Error:|error:' "$LOG"; then TAIL=$(grep -E -A6 -m1 'What went wrong|Error:|error:' "$LOG")
-                else TAIL=$(tail -n 12 "$LOG"); fi
-              fi
-              TAIL=$(printf '%s' "$TAIL" | cut -c1-150 | head -n 12 | esc)
-              tg_edit "$(em fail ❌) <b>Build Gagal</b> <code>#${JOB_ID}</code>
-          <blockquote>$(em clock ⏱) Durasi: ${DURH}</blockquote>
-          <pre>${TAIL}</pre>" "$KB"
-              notify_admin "$(em fail ❌) <b>Build Gagal</b> <code>#${JOB_ID}</code>
-          <blockquote>$(user_label) · $(kind_label)</blockquote>"
+              echo "::warning::Tidak bisa memproses ikon, pakai ikon default."
+              rm -rf webview/app/src/main/res/mipmap-xxxhdpi
             fi
           fi
+
+          # tulis file yang memuat input user lewat python (aman dari injeksi shell / XML / Java)
+          START_URL="$START_URL" LABEL="$LABEL" ICON_ATTR="$ICON_ATTR" python3 - <<'PY'
+          import os
+          from xml.sax.saxutils import escape, quoteattr
+          url = os.environ["START_URL"]; label = os.environ["LABEL"]; icon = os.environ["ICON_ATTR"]
+          base = "webview/app/src/main/"
+          def jstr(s): return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ").replace("\r", " ")
+          open(base + "AndroidManifest.xml", "w", encoding="utf-8").write(f'''<?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <application
+                  android:label={quoteattr(label)}
+                  {icon}
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/AppTheme">
+                  <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          ''')
+          open(base + "res/values/styles.xml", "w", encoding="utf-8").write('''<resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar" />
+          </resources>
+          ''')
+          open(base + "java/app/webview/MainActivity.java", "w", encoding="utf-8").write('''package app.webview;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          public class MainActivity extends Activity {
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  webView = new WebView(this);
+                  WebSettings s = webView.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(true);
+                  s.setLoadWithOverviewMode(true);
+                  s.setUseWideViewPort(true);
+                  s.setMediaPlaybackRequiresUserGesture(false);
+                  webView.setWebChromeClient(new WebChromeClient());
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          String u = r.getUrl().toString();
+                          if (u.startsWith("http") || u.startsWith("file:")) return false;
+                          try { startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(u))); } catch (Exception e) { }
+                          return true;
+                      }
+                  });
+                  setContentView(webView);
+                  if (savedInstanceState != null) webView.restoreState(savedInstanceState);
+                  else webView.loadUrl("''' + jstr(url) + '''");
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle out) {
+                  super.onSaveInstanceState(out);
+                  webView.saveState(out);
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView.canGoBack()) webView.goBack(); else super.onBackPressed();
+              }
+          }
+          ''')
+          PY
+
+          cat > webview/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "WebToApk"
+          include(":app")
+          EOF
+          cat > webview/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+          cat > webview/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          EOF
+          cat > webview/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+          android {
+              namespace 'app.webview'
+              compileSdk 35
+              defaultConfig {
+                  applicationId 'app.webview.apk'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                  }
+              }
+          }
+          EOF
+          cd webview
+          gradle wrapper --gradle-version 8.10.2
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+          cd ..
+          APK="$(find webview/app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
+          [ -n "$APK" ] || { echo "::error::APK WebView tidak ditemukan."; exit 1; }
+          cp "$APK" output/app-unsigned.apk
+
+      # ───────────────────────── SIGN (Android native & Web, release) ─────────────────────────
+      - name: Sign APK release
+        if: success() && (steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'web' || steps.detect.outputs.type == 'webzip') && env.IN_BUILD_TYPE == 'release'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -f output/app-unsigned.apk ] || { echo "::error::[SIGN] output/app-unsigned.apk tidak ditemukan."; ls -la output; exit 1; }
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          BT="$(ls -d "$SDK_ROOT"/build-tools/*/ 2>/dev/null | sort -V | tail -1 | sed 's:/*$::')"
+          [ -x "$BT/zipalign" ] && [ -x "$BT/apksigner" ] || { echo "::error::[SIGN] build-tools tidak ditemukan di $SDK_ROOT"; exit 1; }
+
+          KS_FILE="release.keystore"
+          if [ -n "${KEYSTORE_BASE64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            echo "[SIGN] Memakai keystore dari secret repo"
+            printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$KS_FILE"
+            KS_PASS="$KEYSTORE_PASSWORD"; KS_ALIAS="$KEY_ALIAS"; KEY_PASS="$KEY_PASSWORD"
+          else
+            echo "[SIGN] Secret keystore tidak ada, memakai debug keystore otomatis"
+            KS_PASS="android"; KS_ALIAS="androiddebugkey"; KEY_PASS="android"
+            keytool -genkeypair -keystore "$KS_FILE" -storepass "$KS_PASS" -alias "$KS_ALIAS" -keypass "$KEY_PASS" \
+              -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+          fi
+          [ -s "$KS_FILE" ] || { echo "::error::[SIGN] keystore kosong / tidak valid."; exit 1; }
+
+          "$BT/zipalign" -f 4 output/app-unsigned.apk output/aligned.apk
+          "$BT/apksigner" sign --ks "$KS_FILE" --ks-pass "pass:$KS_PASS" --ks-key-alias "$KS_ALIAS" --key-pass "pass:$KEY_PASS" \
+            --out output/app-release.apk output/aligned.apk
+          "$BT/apksigner" verify --verbose output/app-release.apk
+          rm -f "$KS_FILE" output/aligned.apk output/app-unsigned.apk
+          ls -la output
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: output/app-release.apk
+          if-no-files-found: error
+          retention-days: 3
