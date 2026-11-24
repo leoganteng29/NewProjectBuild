@@ -246,45 +246,62 @@ jobs:
             }
           fi
 
-      - name: Build Flutter APK (project bersih)
+      - name: Build Flutter APK (project bersih, arm64 + split)
         if: steps.detect.outputs.type == 'flutter'
         working-directory: /tmp/fresh_flutter
         shell: bash
         run: |
           set -euo pipefail
 
-          # Double-check tidak ada enableR8
           find . -name "gradle.properties" -exec sed -i -E '/android\.enableR8/d;/android\.enableD8/d' {} \; 2>/dev/null || true
           cat android/gradle.properties || true
 
           flutter clean || true
           flutter pub get
 
+          # Prioritas: arm64 saja (paling kecil, cukup untuk hampir semua HP modern)
+          # Lalu split-per-abi sebagai cadangan
           if [ "$IN_BUILD_TYPE" = "debug" ]; then
-            flutter build apk --debug --no-tree-shake-icons
+            flutter build apk --debug --no-tree-shake-icons --target-platform android-arm64 \
+              || flutter build apk --debug --no-tree-shake-icons --split-per-abi \
+              || flutter build apk --debug --no-tree-shake-icons
           else
-            flutter build apk --release --no-tree-shake-icons
+            flutter build apk --release --no-tree-shake-icons --target-platform android-arm64 \
+              || flutter build apk --release --no-tree-shake-icons --split-per-abi \
+              || flutter build apk --release --no-tree-shake-icons
           fi
 
-          # Verifikasi APK ada
-          APK="$(find build/app/outputs/flutter-apk -name '*.apk' -print -quit)"
-          if [ -z "$APK" ]; then
-            echo "::error::APK tidak ditemukan setelah build"
-            find build -name '*.apk' || true
-            exit 1
-          fi
-          echo "APK berhasil: $APK ($(du -h "$APK" | cut -f1))"
+          echo "=== APK yang dihasilkan ==="
+          find build/app/outputs/flutter-apk -type f -name '*.apk' -exec ls -lh {} \; || true
 
-      - name: Kumpulkan APK Flutter
+      - name: Kumpulkan APK Flutter (pilih yang paling cocok dikirim)
         if: steps.detect.outputs.type == 'flutter'
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find /tmp/fresh_flutter/build/app/outputs/flutter-apk -type f -name '*.apk' -print -quit)"
-          [ -n "$APK" ] || APK="$(find /tmp/fresh_flutter -type f -name '*.apk' -print -quit)"
+          OUTDIR="/tmp/fresh_flutter/build/app/outputs/flutter-apk"
+          mkdir -p output
+
+          # Urutan preferensi: arm64 → armeabi-v7a → universal/lainnya, pilih yang ADA
+          APK=""
+          for pattern in "*arm64*.apk" "*armeabi*.apk" "*.apk"; do
+            CAND="$(find "$OUTDIR" -type f -name "$pattern" 2>/dev/null | head -1 || true)"
+            if [ -n "$CAND" ] && [ -f "$CAND" ]; then
+              APK="$CAND"
+              break
+            fi
+          done
+          [ -n "$APK" ] || APK="$(find /tmp/fresh_flutter -type f -name '*.apk' -print -quit || true)"
           [ -n "$APK" ] || { echo "::error::APK Flutter tidak ditemukan."; find /tmp/fresh_flutter -name '*.apk' || true; exit 1; }
+
           cp "$APK" output/app-release.apk
-          ls -lh output/app-release.apk
+          SIZE=$(stat -c%s output/app-release.apk 2>/dev/null || stat -f%z output/app-release.apk)
+          echo "APK dipilih: $APK ($(du -h output/app-release.apk | cut -f1), $SIZE bytes)"
+
+          # Info: jika masih > 50 MB, bot akan kirim via MTProto (file langsung, bukan link)
+          if [ "$SIZE" -gt 52428800 ]; then
+            echo "::warning::APK masih > 50 MB — bot akan kirim via MTProto sebagai file langsung"
+          fi
 
       # ───────────────────────── ANDROID NATIVE ─────────────────────────
       - name: Build Android native
