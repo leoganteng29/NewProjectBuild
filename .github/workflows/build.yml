@@ -143,7 +143,10 @@ jobs:
             exit 1
           fi
 
-      # ───────────────────────── FLUTTER ─────────────────────────
+      # ───────────────────────── FLUTTER (strategi 100% sukses) ─────────────────────────
+      # Strategi: SELALU buat project Flutter bersih, lalu salin hanya kode user (lib/, assets, pubspec).
+      # Ini menghindari android/ folder rusak / enableR8 / AGP lama dari ZIP user.
+
       - name: Setup Flutter
         if: steps.detect.outputs.type == 'flutter'
         uses: subosito/flutter-action@v2
@@ -151,125 +154,137 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Siapkan folder android (jika belum ada)
+      - name: Buat project Flutter bersih + salin kode user
         if: steps.detect.outputs.type == 'flutter'
-        working-directory: ${{ env.FLUTTER_PROJECT }}
         shell: bash
         run: |
           set -euo pipefail
-          if [ ! -d android ]; then
-            echo "Folder android/ tidak ada, membuat dengan flutter create..."
-            flutter create . --platforms=android
+
+          SRC="${FLUTTER_PROJECT}"
+          echo "Sumber project user: $SRC"
+          ls -la "$SRC" | head -30
+
+          # 1. Buat project Flutter BARU yang bersih di folder terpisah
+          rm -rf /tmp/fresh_flutter
+          mkdir -p /tmp/fresh_flutter
+          cd /tmp
+          flutter create --platforms=android --org com.apkbuilder --project-name appbuilder fresh_flutter
+          cd fresh_flutter
+
+          # 2. Salin pubspec.yaml user
+          if [ -f "$SRC/pubspec.yaml" ]; then
+            cp "$SRC/pubspec.yaml" pubspec.yaml
+            # Pastikan name hanya berisi karakter valid (huruf kecil, angka, underscore)
+            # Jangan ganti paksa ke "appbuilder" supaya import package:xxx tetap jalan
+            CURRENT_NAME=$(grep -E '^name:' pubspec.yaml | head -1 | sed -E 's/^name:[[:space:]]*//' | tr -d '"' | tr -d "'")
+            SAFE_NAME=$(echo "$CURRENT_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_]/_/g' | sed -E 's/^_+|_+$//g')
+            [ -z "$SAFE_NAME" ] && SAFE_NAME="appbuilder"
+            sed -i -E "s/^name:[[:space:]]*.*/name: $SAFE_NAME/" pubspec.yaml || true
+            echo "Package name: $SAFE_NAME"
           fi
 
-      - name: Samakan versi Gradle / AGP / Kotlin + bersihkan properti deprecated
-        if: steps.detect.outputs.type == 'flutter'
-        working-directory: ${{ env.FLUTTER_PROJECT }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 1) Gradle wrapper → versi stabil yang kompatibel dengan AGP 8.x
-          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
-          if [ -f "$WRAPPER" ]; then
-            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-all.zip#' "$WRAPPER"
-            grep distributionUrl "$WRAPPER" || true
-          fi
-
-          # 2) Paksa AGP & Kotlin ke versi yang didukung Flutter stable saat ini
-          MIN_AGP="8.7.3"
-          MIN_KOTLIN="2.0.21"
-          for FILE in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts; do
-            [ -f "$FILE" ] || continue
-            sed -i -E "s#(id\(?[\"']com\.android\.application[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE" || true
-            sed -i -E "s#(classpath ?[\"']com\.android\.tools\.build:gradle:)[0-9.]+([\"'])#\1${MIN_AGP}\2#" "$FILE" || true
-            sed -i -E "s#(id\(?[\"']org\.jetbrains\.kotlin\.android[\"']\)? version ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE" || true
-            sed -i -E "s#(ext\.kotlin_version ?= ?[\"'])[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE" || true
-            sed -i -E "s#(classpath ?[\"']org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9.]+([\"'])#\1${MIN_KOTLIN}\2#" "$FILE" || true
-          done
-
-          # 3) HAPUS opsi yang sudah dihapus di AGP 7+ (penyebab error "android.enableR8 is deprecated")
-          if [ -f android/gradle.properties ]; then
-            sed -i -E \
-              -e '/^[[:space:]]*android\.enableR8[[:space:]]*=/d' \
-              -e '/^[[:space:]]*android\.enableD8[[:space:]]*=/d' \
-              -e '/^[[:space:]]*android\.enableBuildCache[[:space:]]*=/d' \
-              -e '/^[[:space:]]*android\.enableSeparateAnnotationProcessing[[:space:]]*=/d' \
-              -e '/^[[:space:]]*android\.enableIncremental[[:space:]]*=/d' \
-              android/gradle.properties
-            # Pastikan properti wajib ada
-            grep -q 'android.useAndroidX' android/gradle.properties || echo 'android.useAndroidX=true' >> android/gradle.properties
-            grep -q 'android.enableJetifier' android/gradle.properties || echo 'android.enableJetifier=true' >> android/gradle.properties
-            # Hindari warning R8 full mode di beberapa project lama
-            grep -q 'android.enableR8.fullMode' android/gradle.properties || echo 'android.enableR8.fullMode=false' >> android/gradle.properties
-            echo "--- android/gradle.properties setelah dibersihkan ---"
-            cat android/gradle.properties || true
-          fi
-
-          # 4) Naikkan compileSdk / targetSdk / minSdk di app/build.gradle(.kts) bila terlalu rendah
-          for APPG in android/app/build.gradle android/app/build.gradle.kts; do
-            [ -f "$APPG" ] || continue
-            # compileSdk / compileSdkVersion
-            sed -i -E 's/compileSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/compileSdk 35/g' "$APPG" || true
-            sed -i -E 's/targetSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/targetSdk 35/g' "$APPG" || true
-            # minSdk minimal 21 (Flutter default modern)
-            sed -i -E 's/minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/minSdk 21/g' "$APPG" || true
-            # namespace wajib di AGP 8+
-            if ! grep -qE 'namespace[[:space:]]' "$APPG"; then
-              # coba ambil dari AndroidManifest package
-              PKG=$(grep -oE 'package="[^"]+"' android/app/src/main/AndroidManifest.xml 2>/dev/null | head -1 | cut -d'"' -f2 || true)
-              if [ -n "$PKG" ]; then
-                if [[ "$APPG" == *.kts ]]; then
-                  sed -i "s/android[[:space:]]*{/android {\n    namespace = \"$PKG\"/" "$APPG" || true
-                else
-                  sed -i "s/android[[:space:]]*{/android {\n    namespace \"$PKG\"/" "$APPG" || true
-                fi
-              fi
+          # 3. Salin folder penting dari project user
+          for DIR in lib assets fonts images resources test; do
+            if [ -d "$SRC/$DIR" ]; then
+              echo "Menyalin $DIR/ ..."
+              rm -rf "./$DIR"
+              cp -a "$SRC/$DIR" .
             fi
           done
 
-          # 5) Hapus local.properties yang berisi path mesin developer (bisa bikin error di CI)
-          rm -f android/local.properties || true
+          # 4. Salin file root yang sering dibutuhkan
+          for F in analysis_options.yaml l10n.yaml flutter_launcher_icons.yaml; do
+            [ -f "$SRC/$F" ] && cp "$SRC/$F" . || true
+          done
 
-      - name: Flutter pub get (dengan fallback)
+          # 5. Kalau user punya android/app/src/main/res (ikon custom), coba salin
+          if [ -d "$SRC/android/app/src/main/res" ]; then
+            echo "Menyalin resource Android custom (ikon/dll)..."
+            cp -a "$SRC/android/app/src/main/res/." android/app/src/main/res/ 2>/dev/null || true
+          fi
+
+          # 6. Pastikan gradle.properties bersih (TANPA enableR8)
+          printf '%s\n' \
+            'org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError' \
+            'android.useAndroidX=true' \
+            'android.enableJetifier=true' \
+            > android/gradle.properties
+
+          # 7. Naikkan SDK
+          for APPG in android/app/build.gradle android/app/build.gradle.kts; do
+            [ -f "$APPG" ] || continue
+            sed -i -E 's/compileSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/compileSdk 35/g' "$APPG" || true
+            sed -i -E 's/targetSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/targetSdk 35/g' "$APPG" || true
+            sed -i -E 's/minSdk(Version)?[[:space:]]*[:=]?[[:space:]]*[0-9]+/minSdk 21/g' "$APPG" || true
+          done
+
+          # 8. Simpan path project bersih ke env
+          echo "FRESH_PROJECT=/tmp/fresh_flutter" >> "$GITHUB_ENV"
+          echo "Project bersih siap di /tmp/fresh_flutter"
+          ls -la /tmp/fresh_flutter
+
+      - name: Flutter pub get (project bersih)
         if: steps.detect.outputs.type == 'flutter'
-        working-directory: ${{ env.FLUTTER_PROJECT }}
+        working-directory: /tmp/fresh_flutter
         shell: bash
         run: |
           set -euo pipefail
           flutter --version
-          # Coba pub get biasa dulu
+          flutter config --no-analytics || true
+
+          # Pastikan lagi tidak ada enableR8
+          find . -name "gradle.properties" -exec sed -i -E '/android\.enableR8/d;/android\.enableD8/d' {} \; 2>/dev/null || true
+
           if ! flutter pub get; then
-            echo "::warning::flutter pub get gagal, coba pub upgrade --major-versions lalu get lagi"
+            echo "::warning::pub get gagal, coba upgrade major versions"
             flutter pub upgrade --major-versions || true
-            flutter pub get
-          fi
-          # Beberapa project punya dependency constraint ketat; longgarkan lewat override jika perlu
-          if [ -f pubspec.yaml ] && grep -q 'dependency_overrides:' pubspec.yaml; then
-            echo "dependency_overrides sudah ada"
+            flutter pub get || {
+              echo "::warning::Masih gagal, coba hapus constraint ketat di pubspec"
+              # Longgarkan dependency yang sering bermasalah
+              sed -i -E 's/(sdk:[[:space:]]*)"[^"]+"/\1">=3.0.0 <4.0.0"/' pubspec.yaml || true
+              flutter pub get
+            }
           fi
 
-      - name: Build Flutter APK
+      - name: Build Flutter APK (project bersih)
         if: steps.detect.outputs.type == 'flutter'
-        working-directory: ${{ env.FLUTTER_PROJECT }}
+        working-directory: /tmp/fresh_flutter
         shell: bash
         run: |
           set -euo pipefail
-          # Bersihkan cache build lama yang sering bikin conflict
+
+          # Double-check tidak ada enableR8
+          find . -name "gradle.properties" -exec sed -i -E '/android\.enableR8/d;/android\.enableD8/d' {} \; 2>/dev/null || true
+          cat android/gradle.properties || true
+
           flutter clean || true
           flutter pub get
+
           if [ "$IN_BUILD_TYPE" = "debug" ]; then
-            flutter build apk --debug --no-tree-shake-icons || flutter build apk --debug
+            flutter build apk --debug --no-tree-shake-icons
           else
-            flutter build apk --release --no-tree-shake-icons || flutter build apk --release
+            flutter build apk --release --no-tree-shake-icons
           fi
+
+          # Verifikasi APK ada
+          APK="$(find build/app/outputs/flutter-apk -name '*.apk' -print -quit)"
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan setelah build"
+            find build -name '*.apk' || true
+            exit 1
+          fi
+          echo "APK berhasil: $APK ($(du -h "$APK" | cut -f1))"
+
       - name: Kumpulkan APK Flutter
         if: steps.detect.outputs.type == 'flutter'
         shell: bash
         run: |
           set -euo pipefail
-          APK="$(find "$FLUTTER_PROJECT/build/app/outputs/flutter-apk" -type f -name '*.apk' -print -quit)"
-          [ -n "$APK" ] || { echo "::error::APK Flutter tidak ditemukan."; exit 1; }
+          APK="$(find /tmp/fresh_flutter/build/app/outputs/flutter-apk -type f -name '*.apk' -print -quit)"
+          [ -n "$APK" ] || APK="$(find /tmp/fresh_flutter -type f -name '*.apk' -print -quit)"
+          [ -n "$APK" ] || { echo "::error::APK Flutter tidak ditemukan."; find /tmp/fresh_flutter -name '*.apk' || true; exit 1; }
           cp "$APK" output/app-release.apk
+          ls -lh output/app-release.apk
 
       # ───────────────────────── ANDROID NATIVE ─────────────────────────
       - name: Build Android native
